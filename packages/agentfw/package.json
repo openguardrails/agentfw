@@ -1,6 +1,6 @@
 {
   "name": "@openguardrails/agentfw",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "The local firewall for AI agents: route and repair them, and keep your secrets off the model, the API relay, and the supply chain. Local credential masking, per-route model routing, and security detectors on the wire. Free and fully open source.",
   "license": "MIT",
   "type": "module",

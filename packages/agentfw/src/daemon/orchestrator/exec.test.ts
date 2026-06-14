@@ -4,6 +4,7 @@ import {
   clampOutputBudget,
   clampOutputBudgetBytes,
   clarifyUpstreamError,
+  dropSwapIncompatibleBetas,
   generationUrl,
   parseOverflowNumbers,
   safeRetryBudget,
@@ -24,6 +25,28 @@ function encode(value: unknown): ArrayBuffer {
 function decode(buf: ArrayBuffer): unknown {
   return JSON.parse(new TextDecoder().decode(buf))
 }
+
+describe('dropSwapIncompatibleBetas', () => {
+  const beta = (h: Headers) => h.get('anthropic-beta')
+
+  it('removes the 1M long-context beta, keeps the rest', () => {
+    const h = new Headers({ 'anthropic-beta': 'prompt-caching-2024-07-31,context-1m-2025-08-07' })
+    dropSwapIncompatibleBetas(h)
+    expect(beta(h)).toBe('prompt-caching-2024-07-31')
+  })
+
+  it('deletes the header when only context-1m was present', () => {
+    const h = new Headers({ 'anthropic-beta': 'context-1m-2025-08-07' })
+    dropSwapIncompatibleBetas(h)
+    expect(h.has('anthropic-beta')).toBe(false)
+  })
+
+  it('is a no-op when there is no anthropic-beta header', () => {
+    const h = new Headers({ 'x-api-key': 'k' })
+    dropSwapIncompatibleBetas(h)
+    expect(h.has('anthropic-beta')).toBe(false)
+  })
+})
 
 describe('generationUrl', () => {
   it('appends the version segment to a host-root base', () => {

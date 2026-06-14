@@ -145,30 +145,6 @@ export function resolveModelRef(modelId: string, providerId?: string): ModelRef 
   return { model, provider: withResolvableAuth(provider), api }
 }
 
-/** Best-effort: find any vision-capable model in the registry to use
- *  as an implicit companion when the user hasn't explicitly configured
- *  one. Excludes a specific (modelId, providerId) so we never pick the
- *  routed model itself (it being text-only is why we're here). Returns
- *  the first match; preference can be added later if needed. */
-export function findAnyVisionModelRef(exclude?: {
-  modelId: string
-  providerId: string
-}): ModelRef | undefined {
-  const reg = getModelRegistry()
-  for (const m of reg.models) {
-    if (!m.input || !m.input.includes('image')) continue
-    if (exclude && m.id === exclude.modelId && m.providerId === exclude.providerId) {
-      continue
-    }
-    const provider = findProvider(reg, m.providerId)
-    if (!provider) continue
-    const api = resolveApi(reg, m)
-    if (!api) continue
-    return { model: m, provider: withResolvableAuth(provider), api }
-  }
-  return undefined
-}
-
 export function resolveRoute(routeKey: string, decoder: DecoderKind): ResolvedRoute {
   const routing = routingFor(getRoutingPolicy(), routeKey)
   const target = routing.target

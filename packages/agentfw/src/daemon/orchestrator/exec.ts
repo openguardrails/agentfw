@@ -194,6 +194,24 @@ export async function applyAuth(headers: Headers, auth: ProviderAuth, id: string
   }
 }
 
+/** Remove request-scoped Anthropic betas that don't survive a model swap. The
+ *  1M long-context beta (`context-1m-*`) is tied to the client's original
+ *  (1M-capable) model and tier; forwarding it to a routed member — a smaller
+ *  companion, a different provider, or a Claude.ai-subscription call — earns a
+ *  hard 400 ("The long context beta is not yet available for this
+ *  subscription"). Other betas (prompt caching, tool betas) are broadly
+ *  compatible and kept. No-op when the header is absent. */
+export function dropSwapIncompatibleBetas(headers: Headers): void {
+  const beta = headers.get('anthropic-beta')
+  if (!beta) return
+  const kept = beta
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s !== '' && !s.startsWith('context-1m'))
+  if (kept.length > 0) headers.set('anthropic-beta', kept.join(','))
+  else headers.delete('anthropic-beta')
+}
+
 /** Drop every auth header the client may have sent — used before injecting
  *  agentfw-managed credentials so the wrong agent's key can't leak upstream. */
 function stripClientAuth(headers: Headers): void {
@@ -490,6 +508,7 @@ async function buildUpstreamRequest(
   }
 
   const headers = filterRequestHeaders(ctx.reqHeaders, new URL(upstreamUrl).host)
+  dropSwapIncompatibleBetas(headers)
   headers.set('content-type', 'application/json')
   headers.set('accept', stream ? 'text/event-stream' : 'application/json')
   if (member.api === 'anthropic-messages' && !headers.has('anthropic-version')) {

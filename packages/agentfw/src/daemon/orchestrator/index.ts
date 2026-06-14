@@ -39,6 +39,7 @@ import {
   type AttemptResult,
   applyAuth,
   clampOutputBudgetBytes,
+  dropSwapIncompatibleBetas,
   execAttempt,
   execStream,
   generationUrl,
@@ -54,7 +55,6 @@ import {
   runWebSearchEmulationLoop,
 } from './web-search-emulation.ts'
 import { preDescribeImages, requestHasImageBlock } from './image-predescribe.ts'
-import { findAnyVisionModelRef } from './resolve.ts'
 import {
   type ModelRef,
   type ResolvedMember,
@@ -228,21 +228,36 @@ async function runBuffered(
       typeof wsCap.providerId === 'string' &&
       wsCap.providerId !== ''
 
-    // Pre-describe pass: when the request carries image blocks but the
-    // routed model can't see them, run a vision companion first to
-    // convert each image into a text description and forward a
-    // text-only request. The companion is either the one the route's
-    // capabilities.vision pins (the user's explicit choice) OR — when
-    // unconfigured — auto-picked from the model registry so the
-    // user's image-bearing request isn't silently dropped. Auto-pick
-    // raises a risk tag on the parent action so the choice is visible
-    // and overridable.
+    // Pre-describe pass: when the request carries image blocks but the routed
+    // model can't see them, run the route's configured vision companion first
+    // to convert each image into a text description and forward a text-only
+    // request. agentfw never auto-picks a companion — an image bound for a
+    // text-only model with no companion configured is a misconfiguration, so
+    // we fail with an actionable message instead of guessing a vision model
+    // (which surfaces confusing, unrelated upstream errors) or dropping it.
     const visionCompanion = resolved.capabilities.vision
     const targetIsTextOnly = !(resolved.model.input ?? []).includes('image')
     const hasImage = requestHasImageBlock(resolved.clientApi, req)
+
+    if (hasImage && targetIsTextOnly && visionCompanion?.via !== 'companion') {
+      logger.warn(
+        `routing: ${ctx.routeKey} — image present but ${resolved.model.id} is text-only and no ` +
+          'vision companion is configured for this route',
+      )
+      return new Response(
+        JSON.stringify({
+          error:
+            `agentfw: routed model "${resolved.model.id}" can't see images and no vision companion ` +
+            "is configured for this route. Configure a vision companion (the route's Vision " +
+            'setting, or `agentfw route vision <route> --companion <model>`) so agentfw can ' +
+            'describe images for it.',
+        }),
+        { status: 400, headers: { 'content-type': 'application/json' } },
+      )
+    }
+
     let workingReq = req
     let preDescribeAttempts: RoutedAttempt[] = []
-    let visionAutoPick: { modelId: string; providerId: string } | undefined
     let visionMemberToUse: ResolvedMember | undefined
     if (visionCompanion?.via === 'companion' && hasImage) {
       visionMemberToUse = {
@@ -251,31 +266,6 @@ async function runBuffered(
         api: visionCompanion.ref.api,
         switchOn: [],
       }
-    } else if (!visionCompanion && hasImage && targetIsTextOnly) {
-      // No explicit companion + the routed model can't see images.
-      // Find any vision-capable model in the registry that isn't the
-      // routed model itself, and use it implicitly. Better than
-      // dropping the image; the risk tag makes the choice visible.
-      const autoRef = findAnyVisionModelRef({
-        modelId: resolved.model.id,
-        providerId: resolved.provider.id,
-      })
-      if (autoRef) {
-        visionMemberToUse = {
-          model: autoRef.model,
-          provider: autoRef.provider,
-          api: autoRef.api,
-          switchOn: [],
-        }
-        visionAutoPick = { modelId: autoRef.model.id, providerId: autoRef.provider.id }
-      } else {
-        logger.warn(
-          `routing: ${ctx.routeKey} — image present, target ${member.model.id} ` +
-            'is text-only, no vision companion configured, and the model registry ' +
-            'has no vision-capable model to auto-pick. The image will be dropped from ' +
-            "the routed model's view.",
-        )
-      }
     }
     if (visionMemberToUse) {
       const pre = await preDescribeImages(resolved.clientApi, req, visionMemberToUse, execCtx)
@@ -283,9 +273,7 @@ async function runBuffered(
       workingReq = pre.request
       logger.info(
         `routed ${ctx.routeKey} → ${member.model.id} [pre-describe ` +
-          `${pre.attempts.length} image(s) via ${visionMemberToUse.model.id}` +
-          `${visionAutoPick ? ' — auto-picked, set capabilities.vision to lock in' : ''}` +
-          `, ok=${pre.ok}]`,
+          `${pre.attempts.length} image(s) via ${visionMemberToUse.model.id}, ok=${pre.ok}]`,
       )
     }
 
@@ -378,22 +366,6 @@ async function runBuffered(
         allAttempts,
         wantsStream,
       )
-      // When pre-describe was implicit (no capabilities.vision
-      // configured), tag the parent so the user sees the auto-pick on
-      // the run row and knows they can lock it in.
-      const risk: RiskTag[] = visionAutoPick
-        ? [
-            {
-              tag: 'vision-companion-auto-picked',
-              severity: 'info',
-              detail: {
-                modelId: visionAutoPick.modelId,
-                providerId: visionAutoPick.providerId,
-                hint: `Configure capabilities.vision on this route to lock it in.`,
-              },
-            },
-          ]
-        : []
       await captureChain(
         {
           agent: ctx.agent,
@@ -406,7 +378,7 @@ async function runBuffered(
         result.ok ? { ir: result.ir, status: result.status } : undefined,
         resolved.configuredTarget,
         { ts: orchStartWall, durMs: performance.now() - orchT0 },
-        risk,
+        [],
       )
       return response
     }
@@ -964,6 +936,33 @@ async function runFusion(
   const { clientApi, panel, judge, synthesizer } = resolved
   const execCtx = { agent: ctx.agent, reqHeaders: ctx.reqHeaders }
 
+  // Misconfiguration guard: the request carries an image, but no panel model can
+  // see images and no multimodal companion is configured. Don't silently hand
+  // an image to a text-only model (or auto-pick some unrelated vision model) —
+  // fail with an actionable message telling the user to configure one.
+  if (requestHasImageBlock(clientApi, req) && !resolved.vision) {
+    const panelCanSeeImages = panel.some((slot) =>
+      (slot.members[0]?.model.input ?? []).includes('image'),
+    )
+    if (!panelCanSeeImages) {
+      const names = panel.map((slot) => slot.members[0]?.model.id).filter(Boolean).join(', ')
+      logger.warn(
+        `routing: ${ctx.routeKey} fusion "${resolved.configuredTarget.id}" received an image but ` +
+          `no panel model can see images and no multimodal model is configured (${names})`,
+      )
+      return new Response(
+        JSON.stringify({
+          error:
+            `agentfw: model fusion "${resolved.configuredTarget.id}" received an image, but none of ` +
+            `its panel models (${names}) can see images and no multimodal model is configured. ` +
+            `Set a Multimodal model on this fusion (Model Fusion tab) so agentfw can describe ` +
+            `images for the text-only models, or add a vision-capable model to the panel.`,
+        }),
+        { status: 400, headers: { 'content-type': 'application/json' } },
+      )
+    }
+  }
+
   beginRequest()
   try {
     const attempts: RoutedAttempt[] = []
@@ -1210,6 +1209,7 @@ async function runSameProtocolSwap(
   if (masked) body = masked.body
 
   const headers = filterRequestHeaders(ctx.reqHeaders, new URL(upstreamUrl).host)
+  dropSwapIncompatibleBetas(headers)
   if (provider.auth.kind === 'passthrough') {
     const extra = await dynamicHeadersFor(ctx.agent)
     for (const [k, v] of Object.entries(extra)) headers.set(k, v)
