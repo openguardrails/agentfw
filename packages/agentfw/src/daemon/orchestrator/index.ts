@@ -879,12 +879,15 @@ async function runJudge(
 
 /** Run the synthesizer: the agent's original request plus a final user turn
  *  carrying the panel answers and the judge analysis, instructing the model to
- *  write the grounded final answer. Falls back to the raw request if the IR
- *  round-trip fails. */
+ *  write the grounded final answer. A text-only synthesizer builds on the
+ *  pre-described request (images already turned to text) so it never receives
+ *  an image it can't handle. Falls back to the raw request if the IR round-trip
+ *  fails. */
 async function runSynthesis(
   synth: ModelRef,
   clientApi: ModelApi,
   req: Record<string, unknown>,
+  describedReq: Record<string, unknown> | undefined,
   answers: PanelAnswer[],
   analysis: string | undefined,
   execCtx: { agent: AgentId; reqHeaders: Headers },
@@ -895,9 +898,13 @@ async function runSynthesis(
     api: synth.api,
     switchOn: [],
   }
+  // A text-only synthesizer can't take the raw image — use the pre-described
+  // request when one exists. A multimodal synthesizer keeps the real image.
+  const synthTextOnly = !(synth.model.input ?? []).includes('image')
+  const base = synthTextOnly && describedReq ? describedReq : req
   let body: Record<string, unknown>
   try {
-    const ir = parseRequestToIR(clientApi, req)
+    const ir = parseRequestToIR(clientApi, base)
     const deliberation =
       `${FUSION_SYNTH_GUIDANCE}\n\nPanel answers:\n${renderPanelAnswers(answers)}` +
       (analysis ? `\n\nJudge analysis:\n${analysis}` : '')
@@ -908,7 +915,7 @@ async function runSynthesis(
     const synthIR: IRRequest = { ...ir, model: synth.model.id, messages, stream: false }
     body = serializeRequestFromIR(clientApi, synthIR) as Record<string, unknown>
   } catch {
-    body = req
+    body = base
   }
   const result = await execAttempt(member, clientApi, body, execCtx)
   const attempt: RoutedAttempt = {
@@ -968,13 +975,15 @@ async function runFusion(
     const attempts: RoutedAttempt[] = []
 
     // Vision bridge — described once for the whole fusion (the combo's single
-    // companion), reused by every text-only panel member. Multimodal members
-    // keep the raw images. Skipped when no panel member is text-only.
+    // companion), reused by every text-only consumer (panel members AND the
+    // synthesizer, which builds on the full request). Multimodal consumers keep
+    // the raw images. Skipped when nothing text-only would receive an image.
     let describedReq: Record<string, unknown> | undefined
     if (resolved.vision && requestHasImageBlock(clientApi, req)) {
-      const anyTextOnly = panel.some((slot) =>
-        slot.members.some((m) => !(m.model.input ?? []).includes('image')),
-      )
+      const isTextOnly = (input: readonly string[] | undefined) => !(input ?? []).includes('image')
+      const anyTextOnly =
+        panel.some((slot) => slot.members.some((m) => isTextOnly(m.model.input))) ||
+        isTextOnly(resolved.synthesizer.model.input)
       if (anyTextOnly) {
         const visionMember: ResolvedMember = {
           model: resolved.vision.model,
@@ -1014,6 +1023,7 @@ async function runFusion(
         synthesizer,
         clientApi,
         req,
+        describedReq,
         answers,
         judged.analysis,
         execCtx,
